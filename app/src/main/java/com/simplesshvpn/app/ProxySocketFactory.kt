@@ -28,8 +28,7 @@ class ProxySocketFactory(
         private const val TAG = "ProxySocketFactory"
 
         private const val CONNECT_TIMEOUT = 30_000
-        private const val READ_TIMEOUT = 30_000
-
+        private const val READ_TIMEOUT = 10_000
         private const val SOCKS_VERSION = 0x05
     }
 
@@ -121,7 +120,7 @@ class ProxySocketFactory(
                 ProxyType.NONE -> {
                     Log.i(
                         TAG,
-                        "Direct connection"
+                        "Connecting directly"
                     )
 
                     socket.connect(
@@ -151,9 +150,16 @@ class ProxySocketFactory(
             closeQuietly(socket)
 
             throw IOException(
-                "Connection timeout: $proxyHost:$proxyPort",
+                "Connection timeout: " +
+                        "${proxyHost ?: "unknown"}:$proxyPort",
                 e
             )
+
+        } catch (e: IOException) {
+
+            closeQuietly(socket)
+
+            throw e
 
         } catch (e: Exception) {
 
@@ -166,9 +172,9 @@ class ProxySocketFactory(
         }
     }
 
-    // ---------------------------------------------------------
-    // HTTP / HTTPS proxy
-    // ---------------------------------------------------------
+    // =========================================================
+    // HTTP / HTTPS PROXY
+    // =========================================================
 
     private fun connectHttpProxy(
         socket: Socket,
@@ -180,11 +186,96 @@ class ProxySocketFactory(
             )
         }
 
+        Log.i(
+            TAG,
+            "HTTP proxy: $proxyHost:$proxyPort"
+        )
+
+        /*
+         * IMPORTANT:
+         *
+         * ProxyType.HTTP:
+         *   Plain TCP -> HTTP request
+         *
+         * ProxyType.HTTPS:
+         *   TLS -> proxy -> HTTP request
+         *
+         * We keep these two modes separate.
+         */
+
+        if (proxyType == ProxyType.HTTPS) {
+
+            connectHttpsProxy(
+                socket,
+                target
+            )
+
+            return
+        }
+
+        // -----------------------------------------------------
+        // Plain HTTP proxy
+        // -----------------------------------------------------
+
+        socket.soTimeout = READ_TIMEOUT
+
+        socket.connect(
+            InetSocketAddress(
+                proxyHost,
+                proxyPort
+            ),
+            CONNECT_TIMEOUT
+        )
+
+        Log.i(
+            TAG,
+            "HTTP proxy TCP connected"
+        )
+
+        val request = buildPayload(
+            target.hostString,
+            target.port
+        )
+
+        Log.i(
+            TAG,
+            "Sending HTTP payload:\n$request"
+        )
+
+        val output = socket.getOutputStream()
+
+        output.write(
+            request.toByteArray(
+                Charsets.ISO_8859_1
+            )
+        )
+
+        output.flush()
+
+        readHttpProxyResponse(
+            socket
+        )
+    }
+
+    // =========================================================
+    // HTTPS PROXY
+    // =========================================================
+
+    private fun connectHttpsProxy(
+        socket: Socket,
+        target: InetSocketAddress
+    ) {
+        if (proxyHost.isNullOrBlank()) {
+            throw IOException(
+                "HTTPS proxy host is empty"
+            )
+        }
+
         socket.soTimeout = READ_TIMEOUT
 
         Log.i(
             TAG,
-            "Connecting proxy $proxyHost:$proxyPort"
+            "Connecting HTTPS proxy $proxyHost:$proxyPort"
         )
 
         socket.connect(
@@ -197,7 +288,34 @@ class ProxySocketFactory(
 
         Log.i(
             TAG,
-            "Proxy TCP connected"
+            "HTTPS proxy TCP connected"
+        )
+
+        val sslContext =
+            javax.net.ssl.SSLContext
+                .getInstance("TLS")
+
+        sslContext.init(
+            null,
+            null,
+            null
+        )
+
+        val sslSocket =
+            sslContext.socketFactory.createSocket(
+                socket,
+                proxyHost,
+                proxyPort,
+                false
+            ) as javax.net.ssl.SSLSocket
+
+        sslSocket.soTimeout = READ_TIMEOUT
+
+        sslSocket.startHandshake()
+
+        Log.i(
+            TAG,
+            "HTTPS proxy TLS handshake successful"
         )
 
         val request = buildPayload(
@@ -205,76 +323,128 @@ class ProxySocketFactory(
             target.port
         )
 
-        Log.d(
+        Log.i(
             TAG,
-            "Payload:\n$request"
+            "Sending HTTPS proxy payload:\n$request"
         )
 
-        val writer = OutputStreamWriter(
-            socket.getOutputStream(),
-            Charsets.ISO_8859_1
-        )
+        val output =
+            sslSocket.outputStream
 
-        writer.write(request)
-        writer.flush()
-
-        val reader = BufferedReader(
-            InputStreamReader(
-                socket.getInputStream(),
+        output.write(
+            request.toByteArray(
                 Charsets.ISO_8859_1
             )
         )
 
-        val statusLine =
-            reader.readLine()
-                ?: throw IOException(
-                    "Proxy returned empty response"
+        output.flush()
+
+        readHttpProxyResponse(
+            sslSocket
+        )
+
+        /*
+         * The SocketFactory API returns the original Socket.
+         *
+         * The TLS socket must remain alive, so we do not close it
+         * here. The underlying socket is now owned by sslSocket.
+         */
+    }
+
+    // =========================================================
+    // READ HTTP RESPONSE
+    // =========================================================
+
+    private fun readHttpProxyResponse(
+        socket: Socket
+    ) {
+        val input =
+            socket.getInputStream()
+
+        val reader =
+            BufferedReader(
+                InputStreamReader(
+                    input,
+                    Charsets.ISO_8859_1
                 )
+            )
+
+        val statusLine =
+            try {
+                reader.readLine()
+            } catch (e: SocketTimeoutException) {
+                throw IOException(
+                    "Proxy connected but did not send an HTTP response " +
+                            "within ${READ_TIMEOUT}ms",
+                    e
+                )
+            }
+
+        if (statusLine.isNullOrBlank()) {
+            throw IOException(
+                "Proxy returned an empty HTTP response"
+            )
+        }
 
         Log.i(
             TAG,
-            "Proxy response: $statusLine"
+            "HTTP proxy response: $statusLine"
         )
 
         val statusCode =
             Regex(
-                "HTTP/\\d\\.\\d\\s+(\\d+)"
+                "^HTTP/\\d\\.\\d\\s+(\\d+)"
             )
                 .find(statusLine)
                 ?.groupValues
                 ?.getOrNull(1)
                 ?.toIntOrNull()
 
-        if (statusCode != 200) {
+        if (statusCode == null) {
+            throw IOException(
+                "Invalid HTTP proxy response: $statusLine"
+            )
+        }
 
-            val headers = StringBuilder()
+        // -----------------------------------------------------
+        // Read HTTP headers
+        // -----------------------------------------------------
 
-            while (true) {
-                val line = reader.readLine()
-                    ?: break
+        val headers =
+            StringBuilder()
 
-                if (line.isEmpty()) {
-                    break
+        while (true) {
+
+            val line =
+                try {
+                    reader.readLine()
+                } catch (e: SocketTimeoutException) {
+                    throw IOException(
+                        "Timeout while reading HTTP proxy headers",
+                        e
+                    )
                 }
 
-                headers
-                    .append(line)
-                    .append('\n')
+            if (line == null || line.isEmpty()) {
+                break
             }
+
+            headers
+                .append(line)
+                .append('\n')
+        }
+
+        Log.d(
+            TAG,
+            "HTTP proxy headers:\n$headers"
+        )
+
+        if (statusCode != 200) {
 
             throw IOException(
                 "HTTP CONNECT failed: " +
                         "$statusLine\n$headers"
             )
-        }
-
-        while (true) {
-            val line = reader.readLine()
-                ?: break
-
-            if (line.isEmpty()) {
-                break
-            }
         }
 
         Log.i(
@@ -283,63 +453,82 @@ class ProxySocketFactory(
         )
     }
 
+    // =========================================================
+    // BUILD PAYLOAD
+    // =========================================================
+
     private fun buildPayload(
         host: String,
         port: Int
     ): String {
 
-        val hostPort = "$host:$port"
+        val hostPort =
+            "$host:$port"
 
         var request =
             payload
                 ?.takeIf {
                     it.isNotBlank()
                 }
-                ?: "CONNECT [host_port] [protocol][crlf]" +
-                        "Host: [host][crlf]" +
-                        "[crlf]"
+                ?: (
+                    "CONNECT [host_port] [protocol][crlf]" +
+                            "Host: [host][crlf]" +
+                            "[crlf]"
+                    )
 
-        request = request
-            .replace(
-                "[host_port]",
-                hostPort
-            )
-            .replace(
-                "[host]",
-                host
-            )
-            .replace(
-                "[port]",
-                port.toString()
-            )
-            .replace(
-                "[protocol]",
-                "HTTP/1.1"
-            )
-            .replace(
-                "[crlf]",
-                "\r\n"
-            )
-            .replace(
-                "[lf]",
-                "\n"
-            )
-            .replace(
-                "\\r\\n",
-                "\r\n"
-            )
-            .replace(
-                "\\n",
-                "\n"
-            )
+        request =
+            request
+                .replace(
+                    "[host_port]",
+                    hostPort
+                )
+                .replace(
+                    "[host]",
+                    host
+                )
+                .replace(
+                    "[port]",
+                    port.toString()
+                )
+                .replace(
+                    "[protocol]",
+                    "HTTP/1.1"
+                )
+                .replace(
+                    "[crlf]",
+                    "\r\n"
+                )
+                .replace(
+                    "[lf]",
+                    "\n"
+                )
+                .replace(
+                    "\\r\\n",
+                    "\r\n"
+                )
+                .replace(
+                    "\\n",
+                    "\n"
+                )
+
+        /*
+         * Make sure the HTTP request has an empty line
+         * terminating the headers.
+         */
 
         if (!request.contains("\r\n\r\n")) {
+
             request =
                 request.trimEnd(
                     '\r',
                     '\n'
-                ) + "\r\n\r\n"
+                ) +
+                        "\r\n\r\n"
         }
+
+        // -----------------------------------------------------
+        // Proxy authentication
+        // -----------------------------------------------------
 
         if (!proxyUser.isNullOrBlank()) {
 
@@ -354,12 +543,16 @@ class ProxySocketFactory(
                     Base64.NO_WRAP
                 )
 
-            val separator = "\r\n\r\n"
+            val separator =
+                "\r\n\r\n"
 
-            request =
+            val beforeEnd =
                 request.substringBeforeLast(
                     separator
-                ) +
+                )
+
+            request =
+                beforeEnd +
                         "\r\nProxy-Authorization: Basic $encoded" +
                         separator
         }
@@ -367,9 +560,9 @@ class ProxySocketFactory(
         return request
     }
 
-    // ---------------------------------------------------------
+    // =========================================================
     // SOCKS5
-    // ---------------------------------------------------------
+    // =========================================================
 
     private fun connectSocks5(
         socket: Socket,
@@ -385,406 +578,4 @@ class ProxySocketFactory(
 
         Log.i(
             TAG,
-            "Connecting SOCKS5 proxy $proxyHost:$proxyPort"
-        )
-
-        socket.connect(
-            InetSocketAddress(
-                proxyHost,
-                proxyPort
-            ),
-            CONNECT_TIMEOUT
-        )
-
-        val input = socket.getInputStream()
-        val output = socket.getOutputStream()
-
-        // -----------------------------------------------------
-        // SOCKS5 greeting
-        // -----------------------------------------------------
-
-        if (!proxyUser.isNullOrBlank()) {
-
-            output.write(
-                byteArrayOf(
-                    0x05.toByte(),
-                    0x02.toByte(),
-                    0x00.toByte(),
-                    0x02.toByte()
-                )
-            )
-
-        } else {
-
-            output.write(
-                byteArrayOf(
-                    0x05.toByte(),
-                    0x01.toByte(),
-                    0x00.toByte()
-                )
-            )
-        }
-
-        output.flush()
-
-        val greeting = ByteArray(2)
-
-        readFully(
-            input,
-            greeting
-        )
-
-        if (
-            (greeting[0].toInt() and 0xff) !=
-            SOCKS_VERSION
-        ) {
-            throw IOException(
-                "Invalid SOCKS5 response version"
-            )
-        }
-
-        val method =
-            greeting[1].toInt() and 0xff
-
-        when (method) {
-
-            // NO AUTHENTICATION
-            0x00 -> {
-                Log.d(
-                    TAG,
-                    "SOCKS5 no authentication"
-                )
-            }
-
-            // USERNAME / PASSWORD
-            0x02 -> {
-
-                if (proxyUser.isNullOrBlank()) {
-                    throw IOException(
-                        "SOCKS5 requires username/password"
-                    )
-                }
-
-                authenticateSocks5(
-                    input,
-                    output
-                )
-            }
-
-            else -> {
-                throw IOException(
-                    "SOCKS5 authentication method rejected: $method"
-                )
-            }
-        }
-
-        // -----------------------------------------------------
-        // SOCKS5 CONNECT request
-        // -----------------------------------------------------
-
-        val hostBytes =
-            target.hostString.toByteArray(
-                Charsets.UTF_8
-            )
-
-        if (hostBytes.isEmpty()) {
-            throw IOException(
-                "SOCKS5 target host is empty"
-            )
-        }
-
-        if (hostBytes.size > 255) {
-            throw IOException(
-                "SOCKS5 target hostname is too long"
-            )
-        }
-
-        // VER
-        writeByte(
-            output,
-            0x05
-        )
-
-        // CMD = CONNECT
-        writeByte(
-            output,
-            0x01
-        )
-
-        // RSV
-        writeByte(
-            output,
-            0x00
-        )
-
-        // ATYP = DOMAIN
-        writeByte(
-            output,
-            0x03
-        )
-
-        // DOMAIN LENGTH
-        writeByte(
-            output,
-            hostBytes.size
-        )
-
-        // DOMAIN
-        output.write(hostBytes)
-
-        // PORT high byte
-        writeByte(
-            output,
-            (target.port shr 8) and 0xff
-        )
-
-        // PORT low byte
-        writeByte(
-            output,
-            target.port and 0xff
-        )
-
-        output.flush()
-
-        // -----------------------------------------------------
-        // SOCKS5 response
-        // -----------------------------------------------------
-
-        val response = ByteArray(4)
-
-        readFully(
-            input,
-            response
-        )
-
-        if (
-            (response[0].toInt() and 0xff) !=
-            SOCKS_VERSION
-        ) {
-            throw IOException(
-                "Invalid SOCKS5 CONNECT response version"
-            )
-        }
-
-        val reply =
-            response[1].toInt() and 0xff
-
-        if (reply != 0x00) {
-
-            throw IOException(
-                "SOCKS5 CONNECT rejected: $reply"
-            )
-        }
-
-        val addressType =
-            response[3].toInt() and 0xff
-
-        when (addressType) {
-
-            // IPv4
-            0x01 -> {
-                readFully(
-                    input,
-                    ByteArray(4)
-                )
-            }
-
-            // DOMAIN
-            0x03 -> {
-
-                val length =
-                    input.read()
-
-                if (length < 0) {
-                    throw IOException(
-                        "Invalid SOCKS5 domain response"
-                    )
-                }
-
-                readFully(
-                    input,
-                    ByteArray(length)
-                )
-            }
-
-            // IPv6
-            0x04 -> {
-                readFully(
-                    input,
-                    ByteArray(16)
-                )
-            }
-
-            else -> {
-                throw IOException(
-                    "Invalid SOCKS5 address type: $addressType"
-                )
-            }
-        }
-
-        // Destination port
-        readFully(
-            input,
-            ByteArray(2)
-        )
-
-        Log.i(
-            TAG,
-            "SOCKS5 CONNECT successful"
-        )
-    }
-
-    // ---------------------------------------------------------
-    // SOCKS5 username/password authentication
-    // ---------------------------------------------------------
-
-    private fun authenticateSocks5(
-        input: InputStream,
-        output: OutputStream
-    ) {
-
-        val user =
-            proxyUser
-                ?.toByteArray(
-                    Charsets.UTF_8
-                )
-                ?: ByteArray(0)
-
-        val pass =
-            (proxyPass ?: "")
-                .toByteArray(
-                    Charsets.UTF_8
-                )
-
-        if (user.isEmpty()) {
-            throw IOException(
-                "SOCKS5 username is empty"
-            )
-        }
-
-        if (user.size > 255) {
-            throw IOException(
-                "SOCKS5 username is too long"
-            )
-        }
-
-        if (pass.size > 255) {
-            throw IOException(
-                "SOCKS5 password is too long"
-            )
-        }
-
-        // Version
-        writeByte(
-            output,
-            0x01
-        )
-
-        // Username length
-        writeByte(
-            output,
-            user.size
-        )
-
-        // Username
-        output.write(user)
-
-        // Password length
-        writeByte(
-            output,
-            pass.size
-        )
-
-        // Password
-        output.write(pass)
-
-        output.flush()
-
-        val authResponse =
-            ByteArray(2)
-
-        readFully(
-            input,
-            authResponse
-        )
-
-        val version =
-            authResponse[0].toInt() and 0xff
-
-        val status =
-            authResponse[1].toInt() and 0xff
-
-        if (version != 0x01) {
-            throw IOException(
-                "Invalid SOCKS5 authentication response"
-            )
-        }
-
-        if (status != 0x00) {
-            throw IOException(
-                "SOCKS5 authentication failed: $status"
-            )
-        }
-
-        Log.d(
-            TAG,
-            "SOCKS5 authentication successful"
-        )
-    }
-
-    // ---------------------------------------------------------
-    // Safe byte writer
-    // ---------------------------------------------------------
-
-    private fun writeByte(
-        output: OutputStream,
-        value: Int
-    ) {
-        output.write(
-            value and 0xff
-        )
-    }
-
-    // ---------------------------------------------------------
-    // Read exactly N bytes
-    // ---------------------------------------------------------
-
-    private fun readFully(
-        input: InputStream,
-        buffer: ByteArray
-    ) {
-
-        var offset = 0
-
-        while (offset < buffer.size) {
-
-            val count =
-                input.read(
-                    buffer,
-                    offset,
-                    buffer.size - offset
-                )
-
-            if (count < 0) {
-                throw IOException(
-                    "Unexpected end of stream"
-                )
-            }
-
-            if (count == 0) {
-                continue
-            }
-
-            offset += count
-        }
-    }
-
-    private fun closeQuietly(
-        socket: Socket
-    ) {
-        try {
-            socket.close()
-        } catch (_: Exception) {
-        }
-    }
-}
+            "Connecting SOCKS5
