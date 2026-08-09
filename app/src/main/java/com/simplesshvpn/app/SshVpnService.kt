@@ -7,13 +7,12 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,7 +20,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class SshVpnService : VpnService() {
 
     companion object {
-        private const val TAG = "SshVpnService"
+
+        private const val TAG =
+            "SshVpnService"
 
         const val ACTION_CONNECT =
             "com.simplesshvpn.app.CONNECT"
@@ -32,26 +33,45 @@ class SshVpnService : VpnService() {
         const val ACTION_STATUS =
             "com.simplesshvpn.app.STATUS"
 
-        const val EXTRA_STATUS = "status"
-        const val EXTRA_MESSAGE = "message"
+        const val EXTRA_STATUS =
+            "status"
+
+        const val EXTRA_MESSAGE =
+            "message"
 
         private const val NOTIFICATION_ID = 1
-        private const val CHANNEL_ID = "ssh_vpn_channel"
+
+        private const val CHANNEL_ID =
+            "ssh_vpn_channel"
+
+        private const val LOCAL_SOCKS_HOST =
+            "127.0.0.1"
+
+        private const val LOCAL_SOCKS_PORT =
+            1080
 
         @Volatile
         var isRunning = false
             private set
     }
 
-    private var vpnInterface: ParcelFileDescriptor? = null
-    private var sshClient: SSHClient? = null
+    private var vpnInterface:
+            ParcelFileDescriptor? = null
 
-    private val running = AtomicBoolean(false)
+    private var sshClient:
+            SSHClient? = null
+
+    private var socksServer:
+            SshSocks5Server? = null
+
+    private val running =
+        AtomicBoolean(false)
 
     private val executor =
         Executors.newCachedThreadPool()
 
-    private var config: ConnectionConfig? = null
+    private var config:
+            ConnectionConfig? = null
 
     override fun onStartCommand(
         intent: Intent?,
@@ -64,7 +84,10 @@ class SshVpnService : VpnService() {
             ACTION_CONNECT -> {
 
                 val cfg =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    if (
+                        Build.VERSION.SDK_INT >=
+                        Build.VERSION_CODES.TIRAMISU
+                    ) {
 
                         intent.getSerializableExtra(
                             ConnectionConfig.EXTRA_CONFIG,
@@ -80,31 +103,35 @@ class SshVpnService : VpnService() {
                         ) as? ConnectionConfig
                     }
 
-                if (cfg != null) {
-
-                    config = cfg
-
-                    startForeground(
-                        NOTIFICATION_ID,
-                        createNotification("Connecting...")
-                    )
-
-                    executor.execute {
-                        connect(cfg)
-                    }
-
-                } else {
+                if (cfg == null) {
 
                     broadcastStatus(
                         "ERROR",
                         "No configuration received"
                     )
+
+                    return START_NOT_STICKY
+                }
+
+                config = cfg
+
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification(
+                        "Connecting..."
+                    )
+                )
+
+                executor.execute {
+
+                    connect(cfg)
                 }
             }
 
             ACTION_DISCONNECT -> {
 
                 disconnect()
+
                 stopSelf()
             }
         }
@@ -116,34 +143,59 @@ class SshVpnService : VpnService() {
         cfg: ConnectionConfig
     ) {
 
-        if (running.getAndSet(true)) {
+        if (
+            running.getAndSet(true)
+        ) {
             return
         }
 
         broadcastStatus(
             "CONNECTING",
-            "Starting connection process..."
+            "Starting connection..."
         )
+
+        var client:
+                SSHClient? = null
 
         try {
 
-            // 1. Create SSH client
+            /*
+             * -------------------------------------------------
+             * 1. SSH client
+             * -------------------------------------------------
+             */
 
             broadcastStatus(
                 "CONNECTING",
                 "Creating SSH client..."
             )
 
-            val client = SSHClient()
+            client =
+                SSHClient()
+
+            /*
+             * NOTE:
+             *
+             * PromiscuousVerifier accepts any SSH host key.
+             * It is convenient for testing, but production apps
+             * should pin/verify the server host key.
+             */
 
             client.addHostKeyVerifier(
                 PromiscuousVerifier()
             )
 
-            client.timeout = 30000
-            client.connectTimeout = 30000
+            client.timeout =
+                30000
 
-            // 2. Setup proxy + payload
+            client.connectTimeout =
+                30000
+
+            /*
+             * -------------------------------------------------
+             * 2. Proxy + Payload
+             * -------------------------------------------------
+             */
 
             val socketFactory =
                 ProxySocketFactory(
@@ -166,7 +218,8 @@ class SshVpnService : VpnService() {
 
                     else ->
                         "${cfg.proxyType} " +
-                                "${cfg.proxyHost}:${cfg.proxyPort}"
+                                "${cfg.proxyHost}:" +
+                                "${cfg.proxyPort}"
                 }
 
             broadcastStatus(
@@ -177,12 +230,15 @@ class SshVpnService : VpnService() {
 
             Log.i(
                 TAG,
-                "Connecting to " +
-                        "${cfg.sshHost}:${cfg.sshPort} " +
+                "SSH ${cfg.sshHost}:${cfg.sshPort} " +
                         "via $proxyInfo"
             )
 
-            // 3. Connect
+            /*
+             * -------------------------------------------------
+             * 3. SSH TCP connection
+             * -------------------------------------------------
+             */
 
             client.connect(
                 cfg.sshHost,
@@ -191,16 +247,22 @@ class SshVpnService : VpnService() {
 
             broadcastStatus(
                 "CONNECTING",
-                "TCP connected, starting authentication..."
+                "SSH TCP connected"
             )
 
-            // 4. Authenticate
+            /*
+             * -------------------------------------------------
+             * 4. SSH authentication
+             * -------------------------------------------------
+             */
 
-            if (!cfg.privateKey.isNullOrBlank()) {
+            if (
+                !cfg.privateKey.isNullOrBlank()
+            ) {
 
                 broadcastStatus(
                     "CONNECTING",
-                    "Authenticating with Private Key..."
+                    "Authenticating with private key..."
                 )
 
                 val keyProvider =
@@ -215,11 +277,13 @@ class SshVpnService : VpnService() {
                     keyProvider
                 )
 
-            } else if (!cfg.password.isNullOrBlank()) {
+            } else if (
+                !cfg.password.isNullOrBlank()
+            ) {
 
                 broadcastStatus(
                     "CONNECTING",
-                    "Authenticating with Password..."
+                    "Authenticating with password..."
                 )
 
                 client.authPassword(
@@ -230,31 +294,76 @@ class SshVpnService : VpnService() {
             } else {
 
                 throw IOException(
-                    "No password or private key provided"
+                    "No SSH password or private key"
                 )
             }
 
-            if (!client.isAuthenticated) {
+            if (
+                !client.isAuthenticated
+            ) {
 
                 throw IOException(
-                    "SSH authentication failed " +
-                            "(wrong username/password or key)"
+                    "SSH authentication failed"
                 )
             }
 
-            sshClient = client
+            sshClient =
+                client
 
             broadcastStatus(
                 "CONNECTING",
                 "SSH authenticated successfully"
             )
 
-            Log.i(
-                TAG,
-                "SSH authenticated successfully"
+            /*
+             * -------------------------------------------------
+             * 5. Start local SOCKS5
+             * -------------------------------------------------
+             *
+             * Hev will connect to:
+             *
+             * 127.0.0.1:1080
+             *
+             * Each CONNECT is then sent through SSH
+             * using direct-tcpip.
+             */
+
+            broadcastStatus(
+                "CONNECTING",
+                "Starting local SOCKS5..."
             )
 
-            // 5. Establish TUN
+            val localSocks =
+                SshSocks5Server(
+                    client,
+                    LOCAL_SOCKS_PORT
+                )
+
+            localSocks.start()
+
+            socksServer =
+                localSocks
+
+            if (
+                !localSocks.isRunning()
+            ) {
+
+                throw IOException(
+                    "Could not start local SOCKS5"
+                )
+            }
+
+            broadcastStatus(
+                "CONNECTING",
+                "SOCKS5 listening on " +
+                        "$LOCAL_SOCKS_HOST:$LOCAL_SOCKS_PORT"
+            )
+
+            /*
+             * -------------------------------------------------
+             * 6. Android TUN
+             * -------------------------------------------------
+             */
 
             broadcastStatus(
                 "CONNECTING",
@@ -263,7 +372,9 @@ class SshVpnService : VpnService() {
 
             val builder =
                 Builder()
-                    .setSession("SimpleSSHVPN")
+                    .setSession(
+                        "SimpleSSHVPN"
+                    )
                     .addAddress(
                         "10.8.0.2",
                         24
@@ -281,6 +392,11 @@ class SshVpnService : VpnService() {
                     .setMtu(1500)
                     .setBlocking(true)
 
+            /*
+             * Prevent the VPN from routing its own
+             * SSH/Proxy traffic back into itself.
+             */
+
             try {
 
                 builder.addDisallowedApplication(
@@ -291,41 +407,73 @@ class SshVpnService : VpnService() {
 
                 Log.w(
                     TAG,
-                    "Could not exclude self: ${e.message}"
+                    "Could not exclude app: " +
+                            e.message
                 )
             }
 
             vpnInterface =
                 builder.establish()
 
-            if (vpnInterface == null) {
+            if (
+                vpnInterface == null
+            ) {
 
                 throw IOException(
-                    "Failed to establish VPN interface " +
-                            "(permission issue?)"
+                    "Failed to establish VPN interface"
                 )
             }
 
-            isRunning = true
+            /*
+             * -------------------------------------------------
+             * 7. VPN is ready
+             * -------------------------------------------------
+             */
+
+            isRunning =
+                true
 
             broadcastStatus(
                 "CONNECTED",
-                "VPN + SSH connected successfully"
+                "SSH + SOCKS5 + TUN ready"
             )
 
             updateNotification(
                 "Connected to ${cfg.sshHost}"
             )
 
-            // 6. Packet loop
+            /*
+             * -------------------------------------------------
+             * 8. Start TUN -> SOCKS5
+             * -------------------------------------------------
+             *
+             * IMPORTANT:
+             *
+             * HevTunnel must be implemented and its native
+             * library must be included in the APK.
+             *
+             * It receives:
+             *
+             * TUN FD
+             *
+             * and sends traffic to:
+             *
+             * 127.0.0.1:1080
+             */
 
-            startPacketLoop(
+            startHevTunnel(
                 vpnInterface!!
             )
 
         } catch (e: Exception) {
 
-            val fullError =
+            Log.e(
+                TAG,
+                "Connection failed",
+                e
+            )
+
+            val message =
                 buildString {
 
                     append(
@@ -335,103 +483,119 @@ class SshVpnService : VpnService() {
                     append(": ")
 
                     append(
-                        e.message ?: "Unknown error"
+                        e.message
+                            ?: "Unknown error"
                     )
 
-                    if (e.cause != null) {
-
-                        append("\nCause: ")
+                    e.cause?.let {
 
                         append(
-                            e.cause?.message
+                            "\nCause: "
+                        )
+
+                        append(
+                            it.message
+                                ?: it.javaClass.simpleName
                         )
                     }
                 }
 
-            Log.e(
-                TAG,
-                "Connection failed",
-                e
-            )
-
             broadcastStatus(
                 "ERROR",
-                fullError
+                message
             )
 
             disconnect()
+
             stopSelf()
         }
     }
 
-    private fun startPacketLoop(
+    /**
+     * Starts TUN -> SOCKS5.
+     *
+     * This replaces the old startPacketLoop().
+     *
+     * The old implementation only read packets from TUN
+     * and discarded them. It did not forward them.
+     */
+    private fun startHevTunnel(
         pfd: ParcelFileDescriptor
     ) {
 
+        val configText =
+            """
+            tunnel:
+              mtu: 1500
+              ipv4: 198.18.0.1
+              ipv6: 'fc00::1'
+
+            socks5:
+              address: 127.0.0.1
+              port: 1080
+              udp: tcp
+
+            misc:
+              connect-timeout: 10000
+              tcp-read-write-timeout: 300000
+              udp-read-write-timeout: 60000
+              log-level: info
+            """.trimIndent()
+
         executor.execute {
-
-            val input =
-                FileInputStream(
-                    pfd.fileDescriptor
-                )
-
-            val output =
-                FileOutputStream(
-                    pfd.fileDescriptor
-                )
-
-            val buffer =
-                ByteArray(32767)
-
-            Log.i(
-                TAG,
-                "Packet loop started (foundation mode)"
-            )
 
             try {
 
-                while (running.get()) {
+                broadcastStatus(
+                    "CONNECTED",
+                    "Starting TUN → SOCKS5..."
+                )
 
-                    val length =
-                        input.read(buffer)
+                val fd =
+                    pfd.fd
 
-                    if (length > 0) {
+                val result =
+                    HevTunnel.start(
+                        configText,
+                        fd
+                    )
 
-                        // Full packet forwarding requires
-                        // a TUN-to-SOCKS implementation.
+                Log.i(
+                    TAG,
+                    "Hev exited: $result"
+                )
 
-                    } else if (length < 0) {
+                if (
+                    running.get()
+                ) {
 
-                        break
-                    }
+                    broadcastStatus(
+                        "ERROR",
+                        "TUN tunnel stopped: $result"
+                    )
+
+                    disconnect()
                 }
 
             } catch (e: Exception) {
 
-                if (running.get()) {
+                Log.e(
+                    TAG,
+                    "Hev tunnel error",
+                    e
+                )
 
-                    Log.e(
-                        TAG,
-                        "Packet loop error",
-                        e
-                    )
+                if (
+                    running.get()
+                ) {
 
                     broadcastStatus(
                         "ERROR",
-                        "Packet loop error: ${e.message}"
+                        "TUN tunnel error: " +
+                                e.message
                     )
-                }
 
-            } finally {
-
-                try {
-                    input.close()
-                } catch (_: Exception) {
-                }
-
-                try {
-                    output.close()
-                } catch (_: Exception) {
+                    disconnect()
                 }
             }
         }
@@ -439,8 +603,112 @@ class SshVpnService : VpnService() {
 
     private fun disconnect() {
 
-        running.set(false)
+        if (
+            !running.getAndSet(false)
+        ) {
+
+            /*
+             * Even if the service was not marked running,
+             * still clean up resources.
+             */
+
+            stopHevSafely()
+            stopSocksSafely()
+            closeVpnSafely()
+            closeSshSafely()
+
+            isRunning = false
+
+            return
+        }
+
         isRunning = false
+
+        Log.i(
+            TAG,
+            "Disconnecting..."
+        )
+
+        /*
+         * Stop TUN->SOCKS first.
+         */
+
+        stopHevSafely()
+
+        /*
+         * Then stop local SOCKS.
+         */
+
+        stopSocksSafely()
+
+        /*
+         * Then close Android TUN.
+         */
+
+        closeVpnSafely()
+
+        /*
+         * Finally close SSH.
+         */
+
+        closeSshSafely()
+
+        broadcastStatus(
+            "DISCONNECTED",
+            "Disconnected"
+        )
+
+        if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.N
+        ) {
+
+            stopForeground(
+                STOP_FOREGROUND_REMOVE
+            )
+
+        } else {
+
+            @Suppress("DEPRECATION")
+
+            stopForeground(true)
+        }
+    }
+
+    private fun stopHevSafely() {
+
+        try {
+
+            HevTunnel.stop()
+
+        } catch (e: Throwable) {
+
+            Log.d(
+                TAG,
+                "Hev stop: ${e.message}"
+            )
+        }
+    }
+
+    private fun stopSocksSafely() {
+
+        try {
+
+            socksServer?.stop()
+
+        } catch (e: Exception) {
+
+            Log.w(
+                TAG,
+                "SOCKS stop error",
+                e
+            )
+        }
+
+        socksServer = null
+    }
+
+    private fun closeVpnSafely() {
 
         try {
 
@@ -450,12 +718,15 @@ class SshVpnService : VpnService() {
 
             Log.w(
                 TAG,
-                "Error closing TUN",
+                "TUN close error",
                 e
             )
         }
 
         vpnInterface = null
+    }
+
+    private fun closeSshSafely() {
 
         try {
 
@@ -465,29 +736,12 @@ class SshVpnService : VpnService() {
 
             Log.w(
                 TAG,
-                "Error disconnecting SSH",
+                "SSH disconnect error",
                 e
             )
         }
 
         sshClient = null
-
-        broadcastStatus(
-            "DISCONNECTED",
-            "Disconnected"
-        )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-
-            stopForeground(
-                STOP_FOREGROUND_REMOVE
-            )
-
-        } else {
-
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
     }
 
     override fun onDestroy() {
@@ -508,13 +762,22 @@ class SshVpnService : VpnService() {
         super.onRevoke()
     }
 
+    override fun onBind(
+        intent: Intent?
+    ): IBinder? {
+
+        return super.onBind(intent)
+    }
+
     private fun broadcastStatus(
         status: String,
         message: String
     ) {
 
         val intent =
-            Intent(ACTION_STATUS).apply {
+            Intent(
+                ACTION_STATUS
+            ).apply {
 
                 putExtra(
                     EXTRA_STATUS,
@@ -557,10 +820,11 @@ class SshVpnService : VpnService() {
                         PendingIntent.FLAG_UPDATE_CURRENT
             )
 
-        return NotificationCompat.Builder(
-            this,
-            CHANNEL_ID
-        )
+        return NotificationCompat
+            .Builder(
+                this,
+                CHANNEL_ID
+            )
             .setContentTitle(
                 "SimpleSSHVPN"
             )
@@ -584,12 +848,12 @@ class SshVpnService : VpnService() {
         text: String
     ) {
 
-        val nm =
+        val manager =
             getSystemService(
                 NotificationManager::class.java
             )
 
-        nm.notify(
+        manager.notify(
             NOTIFICATION_ID,
             createNotification(text)
         )
@@ -609,12 +873,12 @@ class SshVpnService : VpnService() {
                     NotificationManager.IMPORTANCE_LOW
                 )
 
-            val nm =
+            val manager =
                 getSystemService(
                     NotificationManager::class.java
                 )
 
-            nm.createNotificationChannel(
+            manager.createNotificationChannel(
                 channel
             )
         }
