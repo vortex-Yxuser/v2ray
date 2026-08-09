@@ -1,20 +1,28 @@
 workflows:
   android-apk:
-    name: Android APK
+    name: Build V2Ray APK
     max_build_duration: 60
 
-    scripts:
-      - name: Set Android SDK location
-        script: |
-          echo "sdk.dir=$ANDROID_SDK_ROOT" > "$CM_BUILD_DIR/local.properties"
+    environment:
+      java: 17
 
-      - name: Make Gradle executable
+    scripts:
+      - name: Fix Gradle wrapper
         script: |
-          chmod +x ./gradlew
+          chmod +x gradlew
+          sed -i 's/DEFAULT_JVM_OPTS=.*/DEFAULT_JVM_OPTS="-Xmx64m -Xms64m"/' gradlew
+
+      - name: Check Gradle
+        script: |
+          ./gradlew --version
+
+      - name: Clean project
+        script: |
+          ./gradlew clean
 
       - name: Build Debug APK
         script: |
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --stacktrace
 
     artifacts:
-      - "**/build/outputs/apk/**/*.apk"
+      - "app/build/outputs/apk/debug/*.apk"
