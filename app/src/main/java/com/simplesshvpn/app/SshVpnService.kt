@@ -1,18 +1,22 @@
 package com.simplesshvpn.app
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
+import androidx.core.app.NotificationCompat
+import net.schmizz.sshj.SSHClient
+import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
+import java.io.IOException
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SshVpnService : VpnService() {
 
@@ -20,29 +24,34 @@ class SshVpnService : VpnService() {
         private const val TAG = "SshVpnService"
 
         const val ACTION_CONNECT =
-            "com.simplesshvpn.app.ACTION_CONNECT"
+            "com.simplesshvpn.app.CONNECT"
 
         const val ACTION_DISCONNECT =
-            "com.simplesshvpn.app.ACTION_DISCONNECT"
+            "com.simplesshvpn.app.DISCONNECT"
 
         const val ACTION_STATUS =
-            "com.simplesshvpn.app.ACTION_STATUS"
+            "com.simplesshvpn.app.STATUS"
 
         const val EXTRA_STATUS = "status"
         const val EXTRA_MESSAGE = "message"
 
-        const val STATUS_CONNECTING = "CONNECTING"
-        const val STATUS_CONNECTED = "CONNECTED"
-        const val STATUS_DISCONNECTED = "DISCONNECTED"
-        const val STATUS_ERROR = "ERROR"
+        private const val NOTIFICATION_ID = 1
+        private const val CHANNEL_ID = "ssh_vpn_channel"
+
+        @Volatile
+        var isRunning = false
+            private set
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var tunnelSocket: Socket? = null
+    private var sshClient: SSHClient? = null
 
-    private var serviceJob: Job? = null
-    private val serviceScope =
-        CoroutineScope(Dispatchers.IO + Job())
+    private val running = AtomicBoolean(false)
+
+    private val executor =
+        Executors.newCachedThreadPool()
+
+    private var config: ConnectionConfig? = null
 
     override fun onStartCommand(
         intent: Intent?,
@@ -53,248 +62,450 @@ class SshVpnService : VpnService() {
         when (intent?.action) {
 
             ACTION_CONNECT -> {
-                connect()
+
+                val cfg =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+                        intent.getSerializableExtra(
+                            ConnectionConfig.EXTRA_CONFIG,
+                            ConnectionConfig::class.java
+                        )
+
+                    } else {
+
+                        @Suppress("DEPRECATION")
+
+                        intent.getSerializableExtra(
+                            ConnectionConfig.EXTRA_CONFIG
+                        ) as? ConnectionConfig
+                    }
+
+                if (cfg != null) {
+
+                    config = cfg
+
+                    startForeground(
+                        NOTIFICATION_ID,
+                        createNotification("Connecting...")
+                    )
+
+                    executor.execute {
+                        connect(cfg)
+                    }
+
+                } else {
+
+                    broadcastStatus(
+                        "ERROR",
+                        "No configuration received"
+                    )
+                }
             }
 
             ACTION_DISCONNECT -> {
+
                 disconnect()
+                stopSelf()
             }
         }
 
         return START_STICKY
     }
 
-    private fun connect() {
+    private fun connect(
+        cfg: ConnectionConfig
+    ) {
 
-        if (serviceJob?.isActive == true) {
-            Log.d(TAG, "Connection already running")
+        if (running.getAndSet(true)) {
             return
         }
 
-        serviceJob = serviceScope.launch {
+        broadcastStatus(
+            "CONNECTING",
+            "Starting connection process..."
+        )
 
-            try {
+        try {
 
-                broadcastStatus(
-                    STATUS_CONNECTING,
-                    "Starting VPN service"
+            // 1. Create SSH client
+
+            broadcastStatus(
+                "CONNECTING",
+                "Creating SSH client..."
+            )
+
+            val client = SSHClient()
+
+            client.addHostKeyVerifier(
+                PromiscuousVerifier()
+            )
+
+            client.timeout = 30000
+            client.connectTimeout = 30000
+
+            // 2. Setup proxy + payload
+
+            val socketFactory =
+                ProxySocketFactory(
+                    cfg.proxyType,
+                    cfg.proxyHost,
+                    cfg.proxyPort,
+                    cfg.proxyUser,
+                    cfg.proxyPass,
+                    cfg.payload
                 )
 
-                val config = loadConfiguration()
+            client.socketFactory =
+                socketFactory
 
-                val proxyInfo = when (config.proxyType) {
+            val proxyInfo =
+                when (cfg.proxyType) {
+
                     ProxyType.NONE ->
                         "Direct"
 
                     else ->
-                        "${config.proxyType} " +
-                                "${config.proxyHost}:${config.proxyPort}"
+                        "${cfg.proxyType} " +
+                                "${cfg.proxyHost}:${cfg.proxyPort}"
                 }
 
-                Log.i(
-                    TAG,
-                    "Connecting to " +
-                            "${config.sshHost}:${config.sshPort} " +
-                            "via $proxyInfo"
-                )
+            broadcastStatus(
+                "CONNECTING",
+                "Connecting via $proxyInfo → " +
+                        "${cfg.sshHost}:${cfg.sshPort}"
+            )
+
+            Log.i(
+                TAG,
+                "Connecting to " +
+                        "${cfg.sshHost}:${cfg.sshPort} " +
+                        "via $proxyInfo"
+            )
+
+            // 3. Connect
+
+            client.connect(
+                cfg.sshHost,
+                cfg.sshPort
+            )
+
+            broadcastStatus(
+                "CONNECTING",
+                "TCP connected, starting authentication..."
+            )
+
+            // 4. Authenticate
+
+            if (!cfg.privateKey.isNullOrBlank()) {
 
                 broadcastStatus(
-                    STATUS_CONNECTING,
-                    "Connecting via $proxyInfo → " +
-                            "${config.sshHost}:${config.sshPort}"
+                    "CONNECTING",
+                    "Authenticating with Private Key..."
                 )
 
-                establishVpnInterface()
+                val keyProvider =
+                    client.loadKeys(
+                        cfg.privateKey,
+                        null as String?,
+                        null
+                    )
 
-                establishSshConnection(config)
+                client.authPublickey(
+                    cfg.username,
+                    keyProvider
+                )
+
+            } else if (!cfg.password.isNullOrBlank()) {
 
                 broadcastStatus(
-                    STATUS_CONNECTED,
-                    "Connected"
+                    "CONNECTING",
+                    "Authenticating with Password..."
                 )
 
-                startPacketLoop()
-
-            } catch (e: Exception) {
-
-                Log.e(
-                    TAG,
-                    "VPN connection failed",
-                    e
+                client.authPassword(
+                    cfg.username,
+                    cfg.password
                 )
 
-                broadcastStatus(
-                    STATUS_ERROR,
-                    e.message ?: "Connection failed"
-                )
+            } else {
 
-                disconnectInternal()
+                throw IOException(
+                    "No password or private key provided"
+                )
             }
-        }
-    }
 
-    private fun establishVpnInterface() {
+            if (!client.isAuthenticated) {
 
-        val builder = Builder()
+                throw IOException(
+                    "SSH authentication failed " +
+                            "(wrong username/password or key)"
+                )
+            }
 
-        builder.setSession("SimpleSSHVPN")
+            sshClient = client
 
-        builder.addAddress(
-            "10.8.0.2",
-            32
-        )
-
-        builder.addRoute(
-            "0.0.0.0",
-            0
-        )
-
-        builder.addDnsServer(
-            "1.1.1.1"
-        )
-
-        builder.addDnsServer(
-            "8.8.8.8"
-        )
-
-        vpnInterface = builder.establish()
-
-            ?: throw IllegalStateException(
-                "Unable to establish VPN interface"
+            broadcastStatus(
+                "CONNECTING",
+                "SSH authenticated successfully"
             )
 
-        Log.i(
-            TAG,
-            "VPN interface established"
-        )
-    }
-
-    private fun establishSshConnection(
-        config: VpnConfig
-    ) {
-
-        /*
-         * This establishes the underlying TCP connection.
-         *
-         * The actual SSH authentication/tunneling should be
-         * performed by SshManager/SshTunnel in the project.
-         */
-
-        if (config.sshHost.isBlank()) {
-            throw IllegalArgumentException(
-                "SSH host is empty"
-            )
-        }
-
-        if (config.sshPort <= 0) {
-            throw IllegalArgumentException(
-                "Invalid SSH port"
-            )
-        }
-
-        tunnelSocket = Socket()
-
-        protect(tunnelSocket)
-
-        tunnelSocket!!.connect(
-            InetSocketAddress(
-                config.sshHost,
-                config.sshPort
-            ),
-            15_000
-        )
-
-        Log.i(
-            TAG,
-            "TCP connection established"
-        )
-    }
-
-    private fun startPacketLoop() {
-
-        val vpn = vpnInterface
-            ?: throw IllegalStateException(
-                "VPN interface is not available"
+            Log.i(
+                TAG,
+                "SSH authenticated successfully"
             )
 
-        serviceScope.launch {
+            // 5. Establish TUN
+
+            broadcastStatus(
+                "CONNECTING",
+                "Creating VPN interface..."
+            )
+
+            val builder =
+                Builder()
+                    .setSession("SimpleSSHVPN")
+                    .addAddress(
+                        "10.8.0.2",
+                        24
+                    )
+                    .addRoute(
+                        "0.0.0.0",
+                        0
+                    )
+                    .addDnsServer(
+                        "8.8.8.8"
+                    )
+                    .addDnsServer(
+                        "1.1.1.1"
+                    )
+                    .setMtu(1500)
+                    .setBlocking(true)
 
             try {
 
+                builder.addDisallowedApplication(
+                    packageName
+                )
+
+            } catch (e: Exception) {
+
+                Log.w(
+                    TAG,
+                    "Could not exclude self: ${e.message}"
+                )
+            }
+
+            vpnInterface =
+                builder.establish()
+
+            if (vpnInterface == null) {
+
+                throw IOException(
+                    "Failed to establish VPN interface " +
+                            "(permission issue?)"
+                )
+            }
+
+            isRunning = true
+
+            broadcastStatus(
+                "CONNECTED",
+                "VPN + SSH connected successfully"
+            )
+
+            updateNotification(
+                "Connected to ${cfg.sshHost}"
+            )
+
+            // 6. Packet loop
+
+            startPacketLoop(
+                vpnInterface!!
+            )
+
+        } catch (e: Exception) {
+
+            val fullError =
+                buildString {
+
+                    append(
+                        e.javaClass.simpleName
+                    )
+
+                    append(": ")
+
+                    append(
+                        e.message ?: "Unknown error"
+                    )
+
+                    if (e.cause != null) {
+
+                        append("\nCause: ")
+
+                        append(
+                            e.cause?.message
+                        )
+                    }
+                }
+
+            Log.e(
+                TAG,
+                "Connection failed",
+                e
+            )
+
+            broadcastStatus(
+                "ERROR",
+                fullError
+            )
+
+            disconnect()
+            stopSelf()
+        }
+    }
+
+    private fun startPacketLoop(
+        pfd: ParcelFileDescriptor
+    ) {
+
+        executor.execute {
+
+            val input =
                 FileInputStream(
-                    vpn.fileDescriptor
-                ).use { input ->
+                    pfd.fileDescriptor
+                )
 
-                    FileOutputStream(
-                        vpn.fileDescriptor
-                    ).use { output ->
+            val output =
+                FileOutputStream(
+                    pfd.fileDescriptor
+                )
 
-                        val buffer =
-                            ByteArray(32 * 1024)
+            val buffer =
+                ByteArray(32767)
 
-                        while (
-                            serviceJob?.isActive == true
-                        ) {
+            Log.i(
+                TAG,
+                "Packet loop started (foundation mode)"
+            )
 
-                            val length =
-                                input.read(buffer)
+            try {
 
-                            if (length <= 0) {
-                                break
-                            }
+                while (running.get()) {
 
-                            /*
-                             * Packet forwarding must be connected
-                             * to the SSH/TUN tunnel implementation.
-                             *
-                             * We intentionally do not pretend that
-                             * reading the TUN packet alone provides
-                             * Internet connectivity.
-                             */
+                    val length =
+                        input.read(buffer)
 
-                            Log.d(
-                                TAG,
-                                "TUN packet received: $length bytes"
-                            )
-                        }
+                    if (length > 0) {
+
+                        // Full packet forwarding requires
+                        // a TUN-to-SOCKS implementation.
+
+                    } else if (length < 0) {
+
+                        break
                     }
                 }
 
             } catch (e: Exception) {
 
-                if (
-                    serviceJob?.isActive == true
-                ) {
+                if (running.get()) {
 
                     Log.e(
                         TAG,
-                        "Packet loop failed",
+                        "Packet loop error",
                         e
                     )
+
+                    broadcastStatus(
+                        "ERROR",
+                        "Packet loop error: ${e.message}"
+                    )
+                }
+
+            } finally {
+
+                try {
+                    input.close()
+                } catch (_: Exception) {
+                }
+
+                try {
+                    output.close()
+                } catch (_: Exception) {
                 }
             }
         }
     }
 
-    private fun loadConfiguration(): VpnConfig {
+    private fun disconnect() {
 
-        /*
-         * Replace this method with the project's existing
-         * configuration provider if one already exists.
-         *
-         * These values are only defaults and should not be
-         * considered real SSH credentials.
-         */
+        running.set(false)
+        isRunning = false
 
-        return VpnConfig(
-            sshHost = "",
-            sshPort = 22,
-            sshUsername = "",
-            sshPassword = "",
-            proxyType = ProxyType.NONE,
-            proxyHost = "",
-            proxyPort = 0
+        try {
+
+            vpnInterface?.close()
+
+        } catch (e: Exception) {
+
+            Log.w(
+                TAG,
+                "Error closing TUN",
+                e
+            )
+        }
+
+        vpnInterface = null
+
+        try {
+
+            sshClient?.disconnect()
+
+        } catch (e: Exception) {
+
+            Log.w(
+                TAG,
+                "Error disconnecting SSH",
+                e
+            )
+        }
+
+        sshClient = null
+
+        broadcastStatus(
+            "DISCONNECTED",
+            "Disconnected"
         )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+
+            stopForeground(
+                STOP_FOREGROUND_REMOVE
+            )
+
+        } else {
+
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+    }
+
+    override fun onDestroy() {
+
+        disconnect()
+
+        executor.shutdownNow()
+
+        super.onDestroy()
+    }
+
+    override fun onRevoke() {
+
+        disconnect()
+
+        stopSelf()
+
+        super.onRevoke()
     }
 
     private fun broadcastStatus(
@@ -305,8 +516,6 @@ class SshVpnService : VpnService() {
         val intent =
             Intent(ACTION_STATUS).apply {
 
-                setPackage(packageName)
-
                 putExtra(
                     EXTRA_STATUS,
                     status
@@ -316,103 +525,98 @@ class SshVpnService : VpnService() {
                     EXTRA_MESSAGE,
                     message
                 )
+
+                setPackage(
+                    packageName
+                )
             }
 
         sendBroadcast(intent)
 
         Log.i(
             TAG,
-            "$status: $message"
+            "[$status] $message"
         )
     }
 
-    private fun disconnect() {
+    private fun createNotification(
+        text: String
+    ): Notification {
 
-        serviceScope.launch {
-            disconnectInternal()
-        }
+        createNotificationChannel()
+
+        val pendingIntent =
+            PendingIntent.getActivity(
+                this,
+                0,
+                Intent(
+                    this,
+                    MainActivity::class.java
+                ),
+                PendingIntent.FLAG_IMMUTABLE or
+                        PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
+        return NotificationCompat.Builder(
+            this,
+            CHANNEL_ID
+        )
+            .setContentTitle(
+                "SimpleSSHVPN"
+            )
+            .setContentText(
+                text
+            )
+            .setSmallIcon(
+                android.R.drawable.ic_lock_lock
+            )
+            .setContentIntent(
+                pendingIntent
+            )
+            .setOngoing(true)
+            .setPriority(
+                NotificationCompat.PRIORITY_LOW
+            )
+            .build()
     }
 
-    private fun disconnectInternal() {
+    private fun updateNotification(
+        text: String
+    ) {
 
-        try {
+        val nm =
+            getSystemService(
+                NotificationManager::class.java
+            )
 
-            tunnelSocket?.close()
+        nm.notify(
+            NOTIFICATION_ID,
+            createNotification(text)
+        )
+    }
 
-        } catch (e: Exception) {
+    private fun createNotificationChannel() {
 
-            Log.w(
-                TAG,
-                "Error closing tunnel socket",
-                e
+        if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.O
+        ) {
+
+            val channel =
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "SSH VPN Service",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+
+            val nm =
+                getSystemService(
+                    NotificationManager::class.java
+                )
+
+            nm.createNotificationChannel(
+                channel
             )
         }
-
-        tunnelSocket = null
-
-        try {
-
-            vpnInterface?.close()
-
-        } catch (e: Exception) {
-
-            Log.w(
-                TAG,
-                "Error closing VPN interface",
-                e
-            )
-        }
-
-        vpnInterface = null
-
-        broadcastStatus(
-            STATUS_DISCONNECTED,
-            "Disconnected"
-        )
-    }
-
-    override fun onDestroy() {
-
-        Log.i(
-            TAG,
-            "VPN service destroyed"
-        )
-
-        serviceJob?.cancel()
-        serviceJob = null
-
-        disconnectInternal()
-
-        serviceScope.cancel()
-
-        super.onDestroy()
-    }
-
-    override fun onRevoke() {
-
-        Log.i(
-            TAG,
-            "VPN permission revoked"
-        )
-
-        disconnectInternal()
-
-        super.onRevoke()
     }
 }
-
-enum class ProxyType {
-    NONE,
-    HTTP,
-    SOCKS5
-}
-
-data class VpnConfig(
-    val sshHost: String,
-    val sshPort: Int,
-    val sshUsername: String,
-    val sshPassword: String,
-    val proxyType: ProxyType,
-    val proxyHost: String,
-    val proxyPort: Int
-)
