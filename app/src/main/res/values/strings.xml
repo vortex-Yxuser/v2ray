@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SimpleSSHVPN</string>
+    <string name="status_disconnected">DISCONNECTED</string>
+    <string name="status_connecting">CONNECTING</string>
+    <string name="status_connected">CONNECTED</string>
+    <string name="status_error">ERROR</string>
+    <string name="connect">CONNECT</string>
+    <string name="disconnect">DISCONNECT</string>
+    <string name="ssh_host">SSH Host</string>
+    <string name="ssh_port">SSH Port</string>
+    <string name="username">Username</string>
+    <string name="password">Password</string>
+    <string name="private_key">Private Key (optional)</string>
+    <string name="proxy_type">Proxy Type</string>
+    <string name="proxy_host">Proxy Host</string>
+    <string name="proxy_port">Proxy Port</string>
+    <string name="proxy_user">Proxy Username</string>
+    <string name="proxy_pass">Proxy Password</string>
+    <string name="payload">Payload</string>
+    <string name="notification_channel_name">VPN Service</string>
+    <string name="notification_title">SimpleSSHVPN</string>
+    <string name="notification_text">VPN is running</string>
+</resources>
