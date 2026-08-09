@@ -28,7 +28,7 @@ class MainActivity : AppCompatActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             startVpnService()
         } else {
-            updateStatus("ERROR", "VPN permission denied")
+            updateStatus("ERROR", "VPN permission denied by user")
             Toast.makeText(this, "VPN permission denied", Toast.LENGTH_LONG).show()
         }
     }
@@ -110,7 +110,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startVpnService(config: ConnectionConfig? = null) {
         val cfg = config ?: collectConfig() ?: return
-        updateStatus("CONNECTING", "Requesting VPN...")
+        updateStatus("CONNECTING", "Requesting VPN permission & starting service...")
 
         val intent = Intent(this, SshVpnService::class.java).apply {
             action = SshVpnService.ACTION_CONNECT
@@ -190,8 +190,10 @@ class MainActivity : AppCompatActivity() {
         binding.btnConnect.isEnabled = status == "DISCONNECTED" || status == "ERROR"
         binding.btnDisconnect.isEnabled = status == "CONNECTED" || status == "CONNECTING"
 
+        // Keep last 3000 characters of log
         val log = binding.tvLog.text.toString()
-        binding.tvLog.text = "$log\n[$status] $message".takeLast(2000)
+        val newLog = "$log\n[$status] $message".takeLast(3000)
+        binding.tvLog.text = newLog
     }
 
     private fun requestNotificationPermissionIfNeeded() {
