@@ -10,18 +10,31 @@ workflows:
       - name: Fix Gradle wrapper
         script: |
           chmod +x gradlew
-          sed -i 's/DEFAULT_JVM_OPTS=.*/DEFAULT_JVM_OPTS="-Xmx64m -Xms64m"/' gradlew
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("gradlew")
+          text = p.read_text()
+
+          lines = text.splitlines()
+          result = []
+
+          for line in lines:
+              if line.startswith("DEFAULT_JVM_OPTS="):
+                  line = 'DEFAULT_JVM_OPTS="-Xmx64m -Xms64m"'
+              result.append(line)
+
+          p.write_text("\n".join(result) + "\n")
+          PY
 
       - name: Check Gradle
         script: |
           ./gradlew --version
 
-      - name: Clean project
-        script: |
-          ./gradlew clean
-
       - name: Build Debug APK
         script: |
+          ./gradlew clean
           ./gradlew assembleDebug --stacktrace
 
     artifacts:
